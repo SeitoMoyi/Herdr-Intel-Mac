@@ -11,7 +11,10 @@ set -euo pipefail
 
 REPO="${HERDR_INTEL_REPO:-SeitoMoyi/Herdr-Intel-Mac}"
 
-app="$HOME/Applications/Herdr.app"
+# Update Herdr where it is: /Applications if it's there, else ~/Applications.
+if [ -n "${HERDR_APP:-}" ]; then app=$HERDR_APP
+elif [ -d /Applications/Herdr.app ]; then app=/Applications/Herdr.app
+else app="$HOME/Applications/Herdr.app"; fi
 bin="$HOME/.local/bin"
 label=local.herdr-intel.update
 agent="$HOME/Library/LaunchAgents/$label.plist"
@@ -33,7 +36,7 @@ case "${1:-update}" in
 <plist version="1.0"><dict>
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key><array><string>/bin/bash</string><string>$self</string></array>
-  <key>EnvironmentVariables</key><dict><key>HERDR_INTEL_REPO</key><string>$REPO</string></dict>
+  <key>EnvironmentVariables</key><dict><key>HERDR_INTEL_REPO</key><string>$REPO</string><key>HERDR_APP</key><string>$app</string></dict>
   <key>StartCalendarInterval</key><dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$log</string>
@@ -80,9 +83,9 @@ if [ "$have" = "$version" ] && [ "${FORCE:-0}" != 1 ]; then
 fi
 
 say "Installing Herdr $version (have: ${have:-none})"
-mkdir -p "$HOME/Applications" "$bin"
+mkdir -p "$(dirname "$app")" "$bin"
 # Stage beside the app so the final swap is a same-volume rename.
-stage="$HOME/Applications/.herdr-intel-staging"
+stage="$(dirname "$app")/.herdr-intel-staging"
 rm -rf "$stage"
 mkdir -p "$stage"
 trap 'rm -rf "$stage"' EXIT
