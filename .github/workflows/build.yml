@@ -1,0 +1,218 @@
+# Builds each official Herdr release for Intel Macs (macOS 13+) and publishes
+# it as a GitHub Release of this repo. Runs every 6 hours and does nothing
+# unless herdr.dev has released a version this repo hasn't built yet.
+name: Build Herdr for Intel Mac
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Herdr version to build, e.g. 0.1.15 (empty: the latest official release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if this repo already has that release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-herdr-intel
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: herdrdev/herdr-app
+  # Oldest macOS the build runs on. Herdr's terminal engine (ghostty) targets 13.0.
+  MIN_MACOS: "13.0"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Pick the version to build
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          if [ -z "$version" ]; then
+            # The official update feed: only versions Herdr has actually shipped.
+            version=$(curl -fsSL --retry 3 https://releases.herdr.dev/app/latest.json | jq -r .version) || version=
+          fi
+          if [ -z "$version" ] || [ "$version" = null ]; then
+            echo "Official feed unreachable; using the newest upstream tag."
+            version=$(git ls-remote --tags --refs "https://github.com/$UPSTREAM" 'v*' \
+              | sed -n 's|.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$|\1|p' | sort -V | tail -1)
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version '$version'"; exit 1; }
+          git ls-remote --exit-code --tags "https://github.com/$UPSTREAM" "refs/tags/v$version" >/dev/null \
+            || { echo "::error::$UPSTREAM has no tag v$version"; exit 1; }
+          build=true
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != true ]; then
+            build=false
+            echo "v$version is already built."
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: v${{ needs.check.outputs.version }}
+          submodules: true
+          persist-credentials: false
+
+      - name: Read upstream's toolchain pins
+        id: pins
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/release.yml
+          rust=$(sed -n 's/^ *RUST_TOOLCHAIN: *//p' "$wf" | head -1 | tr -d "\"' ")
+          zig=$(sed -n 's/^ *ZIG_VERSION: *//p' "$wf" | head -1 | tr -d "\"' ")
+          [ -n "$rust" ] && [ -n "$zig" ] || { echo "::error::cannot read RUST_TOOLCHAIN/ZIG_VERSION from $wf"; exit 1; }
+          echo "Rust $rust, Zig $zig"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "zig=$zig" >> "$GITHUB_OUTPUT"
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$v" = "$VERSION" ] || { echo "::error::tag v$VERSION but Cargo.toml says $v"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.pins.outputs.rust }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.pins.outputs.zig }}
+
+      - name: Build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: intel-${{ env.MIN_MACOS }}-${{ steps.pins.outputs.rust }}-zig${{ steps.pins.outputs.zig }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            intel-${{ env.MIN_MACOS }}-${{ steps.pins.outputs.rust }}-zig${{ steps.pins.outputs.zig }}-
+
+      - name: Build
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ env.MIN_MACOS }}
+        # No HERDR_APP_RELEASE: a source build never pulls the official
+        # Apple Silicon updates and never sends release telemetry.
+        run: cargo build --release --locked
+
+      - name: Check the binary
+        run: |
+          set -euo pipefail
+          exe=target/release/herdr-app
+          file "$exe"
+          file "$exe" | grep -q 'x86_64' || { echo "::error::not an x86_64 binary"; exit 1; }
+          minos=$(otool -l "$exe" | awk '/LC_BUILD_VERSION/ {f=1} f && $1 == "minos" {print $2; exit}')
+          echo "minos: $minos"
+          [ "$(printf '%s\n' "$minos" "$MIN_MACOS" | sort -V | tail -1)" = "$MIN_MACOS" ] \
+            || { echo "::error::binary needs macOS $minos, wanted $MIN_MACOS"; exit 1; }
+          if otool -L "$exe" | tail -n +2 | awk '{print $1}' | grep -v -E '^(/System/Library/|/usr/lib/)'; then
+            echo "::error::links a non-system library"; exit 1
+          fi
+          out=$("$exe" --version)
+          [ "$out" = "herdr-app $VERSION" ] || { echo "::error::--version says '$out'"; exit 1; }
+
+      - name: Package Herdr.app
+        run: |
+          set -euo pipefail
+          app=dist/Herdr.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/herdr-app "$app/Contents/MacOS/Herdr"
+          cp assets/icons/Herdr.icns "$app/Contents/Resources/Herdr.icns"
+          cp LICENSE THIRD-PARTY-NOTICES "$app/Contents/Resources/"
+          # Same as upstream scripts/package, plus LSMinimumSystemVersion.
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+              <key>CFBundleExecutable</key><string>Herdr</string>
+              <key>CFBundleIdentifier</key><string>dev.herdr.app</string>
+              <key>CFBundleName</key><string>Herdr</string>
+              <key>CFBundleDisplayName</key><string>Herdr</string>
+              <key>CFBundleIconFile</key><string>Herdr</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>$VERSION</string>
+              <key>CFBundleVersion</key><string>$VERSION</string>
+              <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
+              <key>NSMicrophoneUsageDescription</key><string>Terminal programs running in Herdr can use the microphone, for example for voice input.</string>
+              <key>NSCameraUsageDescription</key><string>Terminal programs running in Herdr can use the camera.</string>
+              <key>NSAppleEventsUsageDescription</key><string>Terminal programs running in Herdr can use AppleScript to control other apps.</string>
+              <key>NSPrincipalClass</key><string>NSApplication</string>
+              <key>NSHighResolutionCapable</key><true/>
+              <key>LSEnvironment</key><dict/></dict></plist>
+          PLIST
+          plutil -lint "$app/Contents/Info.plist"
+          codesign --force --sign - "$app"
+          codesign --verify --strict "$app"
+          tar -czf dist/herdr-app-macos-x86_64.tar.gz -C dist Herdr.app
+          (cd dist && shasum -a 256 herdr-app-macos-x86_64.tar.gz > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: herdr-app-macos-x86_64
+          path: |
+            dist/herdr-app-macos-x86_64.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: herdr-app-macos-x86_64
+          path: dist
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --yes --cleanup-tag
+          fi
+          gh release create "$tag" dist/herdr-app-macos-x86_64.tar.gz dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --latest \
+            --title "Herdr $VERSION for Intel Mac" \
+            --notes "Unofficial Intel Mac (x86_64, macOS $MIN_MACOS+) build of [$UPSTREAM v$VERSION](https://github.com/$UPSTREAM/tree/v$VERSION), compiled from source on a GitHub-hosted Intel runner. Ad hoc signed, not notarized. What's new: [CHANGELOG](https://github.com/$UPSTREAM/blob/v$VERSION/CHANGELOG.md)."
+      # A commit per release keeps the repo "active", so GitHub doesn't
+      # switch the schedule off after 60 quiet days.
+      - name: Record the built version
+        run: |
+          set -euo pipefail
+          echo "$VERSION" > LATEST
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add LATEST
+          git diff --cached --quiet || { git commit -m "Built Herdr $VERSION"; git push; }
