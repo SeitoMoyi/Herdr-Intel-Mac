@@ -9,7 +9,7 @@
 # Set REPO below (or HERDR_INTEL_REPO) to your GitHub "owner/name".
 set -euo pipefail
 
-REPO="${HERDR_INTEL_REPO:-OWNER/herdr-intel-mac}"
+REPO="${HERDR_INTEL_REPO:-SeitoMoyi/Herdr-Intel-Mac}"
 
 app="$HOME/Applications/Herdr.app"
 bin="$HOME/.local/bin"

@@ -26,8 +26,12 @@ concurrency:
 
 env:
   UPSTREAM: herdrdev/herdr-app
-  # Oldest macOS the build runs on. Herdr's terminal engine (ghostty) targets 13.0.
-  MIN_MACOS: "13.0"
+  # Oldest macOS the build runs on. Upstream ghostty defaults to 13.0; the
+  # build lowers it, and the SDK check below proves the app loads on 12.0.
+  MIN_MACOS: "12.0"
+  # The real macOS 12.0 SDK, used only to check the finished binary.
+  CHECK_SDK_URL: https://github.com/joseluisq/macosx-sdks/releases/download/12.0/MacOSX12.0.sdk.tar.xz
+  CHECK_SDK_SHA256: ac07f28c09e6a3b09a1c01f1535ee71abe8017beaedd09181c8f08936a510ffd
 
 jobs:
   check:
@@ -80,6 +84,11 @@ jobs:
           ref: v${{ needs.check.outputs.version }}
           submodules: true
           persist-credentials: false
+      # This repo's own scripts, beside the upstream source.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .ci
+          persist-credentials: false
 
       - name: Read upstream's toolchain pins
         id: pins
@@ -114,12 +123,29 @@ jobs:
           restore-keys: |
             intel-${{ env.MIN_MACOS }}-${{ steps.pins.outputs.rust }}-zig${{ steps.pins.outputs.zig }}-
 
+      - name: Target macOS ${{ env.MIN_MACOS }} in the ghostty build
+        # ghostty-sys passes Zig a bare "x86_64-macos", which ghostty turns
+        # into 13.0. A version in the target triple takes precedence.
+        run: |
+          set -euo pipefail
+          f=crates/ghostty-sys/build.rs
+          grep -q '"x86_64-apple-darwin" => "x86_64-macos",' "$f" \
+            || { echo "::error::$f changed upstream; update this patch"; exit 1; }
+          sed -i '' "s/\"x86_64-apple-darwin\" => \"x86_64-macos\",/\"x86_64-apple-darwin\" => \"x86_64-macos.$MIN_MACOS\",/" "$f"
+          grep -n 'x86_64-apple-darwin' "$f"
+
       - name: Build
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ env.MIN_MACOS }}
+          # ScreenCaptureKit is linked through a dependency but unused by Herdr;
+          # it only exists from macOS 12.3, so load it only if present.
+          RUSTFLAGS: -C link-arg=-Wl,-weak_framework,ScreenCaptureKit
         # No HERDR_APP_RELEASE: a source build never pulls the official
         # Apple Silicon updates and never sends release telemetry.
-        run: cargo build --release --locked
+        run: |
+          set -o pipefail
+          cargo build --release --locked 2>&1 | tee build.log
+          grep -i 'built for newer macOS version' build.log | sort -u | sed 's/^/::warning::/' || true
 
       - name: Check the binary
         run: |
@@ -136,6 +162,17 @@ jobs:
           fi
           out=$("$exe" --version)
           [ "$out" = "herdr-app $VERSION" ] || { echo "::error::--version says '$out'"; exit 1; }
+
+      - name: Check it loads on macOS ${{ env.MIN_MACOS }}
+        run: |
+          set -euo pipefail
+          sdk_dir="$RUNNER_TEMP/check-sdk"
+          mkdir -p "$sdk_dir"
+          curl -fsSL --retry 3 "$CHECK_SDK_URL" -o "$sdk_dir/sdk.tar.xz"
+          echo "$CHECK_SDK_SHA256  $sdk_dir/sdk.tar.xz" | shasum -a 256 -c
+          tar -xJf "$sdk_dir/sdk.tar.xz" -C "$sdk_dir"
+          sdk=$(find "$sdk_dir" -maxdepth 1 -name 'MacOSX*.sdk' -type d | head -1)
+          python3 -I "$GITHUB_WORKSPACE/.ci/scripts/check-macos-sdk.py" target/release/herdr-app "$sdk"
 
       - name: Package Herdr.app
         run: |
